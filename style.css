@@ -5,3 +5,7 @@
 @media(min-width:850px){.viewport{height:450px}.app-shell{padding-top:34px}.content-grid{grid-template-columns:1.05fr .95fr}.panel{padding:22px}}
 @media(max-width:650px){.app-shell{padding:20px 12px 30px}.intro{align-items:start;flex-direction:column;padding-bottom:18px}.intro h1{font-size:39px}.status-pill{margin:0}.viewport{height:310px}.viewer-footer{gap:9px}.viewer-footer span:last-child{width:100%;margin-left:0}.quick-controls{gap:8px}.control-tile{padding:11px 9px;gap:8px}.tile-icon{width:32px;height:32px}.control-tile b{font-size:10px}.control-tile small{font-size:9px}.content-grid{grid-template-columns:1fr;gap:0}.panel{padding:15px}.library-grid{gap:7px}.model-art{height:82px}.model-art i{width:23px;height:23px;border-width:4px}.model-card>b{font-size:10px}.model-card>small{font-size:8px}.measurement-grid strong{font-size:17px}.brand-copy{font-size:11px}}
   
+.zoom-actions{position:absolute;right:12px;top:50%;transform:translateY(-50%);display:grid;gap:6px;z-index:3}
+.zoom-actions button{width:38px;height:38px;border-radius:10px;border:1px solid #34435a;background:#0b1221dd;color:var(--cyan);font-size:20px;line-height:1;padding:0}
+.zoom-actions button:active{background:#253b53}
+.viewport.blueprint-mode .zoom-actions button{background:#06285fdd;border-color:#4f86d6;color:#fff}
