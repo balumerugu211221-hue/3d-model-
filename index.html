@@ -1,1 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#080d18">
+  <title>3D Model Studio | GPU Lab</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand-mark">3D</div>
+    <div class="brand-copy"><strong>MODEL STUDIO</strong><span>GPU LAB · CAD WORKSPACE</span></div>
+    <button id="themeBtn" class="icon-btn" aria-label="Toggle theme">◐</button>
+  </header>
 
+  <main class="app-shell">
+    <section class="intro">
+      <div>
+        <p class="eyebrow">DESIGN · INSPECT · EXPORT</p>
+        <h1>Build in 3D.<br><span>Think in detail.</span></h1>
+        <p class="subtext">Explore a demo graphics card, inspect its parts, and import or export STL files.</p>
+      </div>
+      <div class="status-pill"><i></i> LOCAL WORKSPACE</div>
+    </section>
+
+    <section class="viewer-card">
+      <div class="panel-heading">
+        <div><span class="eyebrow">LIVE VIEWPORT</span><h2 id="modelTitle">Phantom GPU · Demo</h2></div>
+        <button id="resetViewBtn" class="small-btn">Reset view ↺</button>
+      </div>
+      <div id="viewport" class="viewport">
+        <div class="viewport-grid"></div>
+        <div class="viewport-label">PERSPECTIVE / MM</div>
+        <div id="loadingNote" class="loading-note">Loading 3D viewport…</div>
+        <div class="view-actions">
+          <button id="view3dBtn" class="view-btn active">3D</button>
+          <button id="blueprintBtn" class="view-btn">Blueprint</button>
+          <button id="wireBtn" class="view-btn">Wireframe</button>
+        </div>
+      </div>
+      <div class="viewer-footer">
+        <span><b class="legend-dot cyan"></b> PCB / structure</span>
+        <span><b class="legend-dot purple"></b> Cooling system</span>
+        <span id="viewportHint">Drag to rotate · pinch to zoom</span>
+      </div>
+    </section>
+
+    <section class="quick-controls">
+      <button id="explodeBtn" class="control-tile"><span class="tile-icon">✣</span><span><b>Exploded view</b><small id="explodeLabel">Parts assembled</small></span><span class="tile-arrow">↗</span></button>
+      <button id="assembleBtn" class="control-tile"><span class="tile-icon">▣</span><span><b>Assemble parts</b><small>Reset component positions</small></span><span class="tile-arrow">↗</span></button>
+    </section>
+
+    <section class="content-grid">
+      <div class="panel">
+        <div class="panel-heading"><div><span class="eyebrow">COMPONENT TREE</span><h2>Parts inspector</h2></div><span class="count-badge" id="partCount">0 parts</span></div>
+        <div id="partsList" class="parts-list"></div>
+        <p class="helper">Tap a component to highlight it. Toggle visibility using the eye button.</p>
+      </div>
+      <div class="panel">
+        <div class="panel-heading"><div><span class="eyebrow">MODEL DETAILS</span><h2>Measurements</h2></div><span class="mini-tag">DEMO DATA</span></div>
+        <div class="measurement-grid">
+          <div><small>Length</small><strong id="lengthValue">280 mm</strong></div>
+          <div><small>Width</small><strong id="widthValue">115 mm</strong></div>
+          <div><small>Height</small><strong id="heightValue">48 mm</strong></div>
+          <div><small>Components</small><strong id="componentValue">6</strong></div>
+        </div>
+        <div class="measure-note"><span>ⓘ</span> Dimensions are illustrative demo values, not a verified manufacturer blueprint.</div>
+        <div class="button-stack">
+          <button id="downloadStlBtn" class="primary-btn">⇩ Export visible model as STL</button>
+          <label class="secondary-btn file-label">＋ Import STL file<input id="stlInput" type="file" accept=".stl,model/stl,application/sla"></label>
+          <button id="downloadBlueprintBtn" class="secondary-btn">⇩ Download blueprint SVG</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel library-panel">
+      <div class="panel-heading"><div><span class="eyebrow">STARTING POINTS</span><h2>Model library</h2></div><span class="mini-tag">PROCEDURAL DEMOS</span></div>
+      <div class="library-grid">
+        <button class="model-card selected" data-model="phantom"><div class="model-art art-one"><span>GPU</span><i></i><i></i><i></i></div><b>Phantom GPU</b><small>Triple-fan · Demo model</small></button>
+        <button class="model-card" data-model="compact"><div class="model-art art-two"><span>MINI</span><i></i><i></i></div><b>Compact GPU</b><small>Dual-fan · Demo model</small></button>
+        <button class="model-card" data-model="workstation"><div class="model-art art-three"><span>PRO</span><i></i></div><b>Workstation card</b><small>Single-fan · Demo model</small></button>
+      </div>
+      <p class="helper">These are generated illustrative shapes, not official NVIDIA/AMD product models.</p>
+    </section>
+
+    <section class="panel assistant-panel">
+      <div class="panel-heading"><div><span class="eyebrow">DESIGN COMPANION</span><h2>Model chat</h2></div><span class="mini-tag">LOCAL DEMO</span></div>
+      <div id="chatMessages" class="chat-messages"><div class="chat-bubble bot">Hi! I can help with basic workspace commands. Try “explode parts”, “blueprint”, “reset view”, or “export STL”. Real AI-generated geometry needs a connected AI/backend service.</div></div>
+      <form id="chatForm" class="chat-form"><input id="chatInput" autocomplete="off" placeholder="Try: explode parts…" aria-label="Chat command"><button class="send-btn" type="submit">Send ↗</button></form>
+      <p class="helper">This chat runs local keyword commands only. It does not call an AI model or generate new CAD geometry.</p>
+    </section>
+
+    <footer class="footer"><span>3D MODEL STUDIO</span><span>Built for mobile · Acode</span></footer>
+  </main>
+  <div id="toast" class="toast" role="status"></div>
+
+  <script type="module" src="script.js"></script>
+</body>
+</html>
