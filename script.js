@@ -1,277 +1,1020 @@
-import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { STLLoader } from 'three/addons/loaders/STLLoader.js';
-import { STLExporter } from 'three/addons/exporters/STLExporter.js';
-
-const $ = (id) => document.getElementById(id);
-const viewport = $('viewport');
-let scene, camera, renderer, controls, floor, modelRoot, currentModel = 'phantom';
-let exploded = false, blueprint = false, wireframe = false, selectedPart = null;
-let partEntries = [], importedObject = null, toastTimer;
-const palette = { pcb: 0x167d89, shroud: 0x293a50, fan: 0x111b2a, metal: 0x8a9fb7, accent: 0x5ee7ef, purple: 0x8e6df0, port: 0xc2d1df };
-const modelSpecs = {
-  phantom: { title: 'Phantom GPU · Demo', length: 280, width: 115, height: 48, fans: 3 },
-  compact: { title: 'Compact GPU · Demo', length: 205, width: 112, height: 39, fans: 2 },
-  workstation: { title: 'Workstation Card · Demo', length: 240, width: 105, height: 38, fans: 1 }
-};
-
-/* ---------- Blueprint materials ---------- */
-const BP_BG = 0x0a3d91;
-const bpFill = new THREE.MeshBasicMaterial({ color: 0x0f4fae, transparent: true, opacity: .38, depthWrite: false, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });
-const bpLine = new THREE.LineBasicMaterial({ color: 0xcdeeff, transparent: true, opacity: .95, depthWrite: false });
-
-const material = (color, extra = {}) => new THREE.MeshStandardMaterial({ color, metalness: extra.metalness ?? .35, roughness: extra.roughness ?? .42, wireframe: wireframe });
-function addBox(parent, name, size, pos, color, opts = {}) {
-  const mesh = new THREE.Mesh(new THREE.BoxGeometry(...size), material(color, opts));
-  mesh.name = name; mesh.position.set(...pos); mesh.castShadow = true; mesh.receiveShadow = true;
-  parent.add(mesh); return mesh;
-}
-function addCylinder(parent, name, radius, depth, pos, color, axis = 'y') {
-  const mesh = new THREE.Mesh(new THREE.CylinderGeometry(radius, radius, depth, 40), material(color, { metalness: .55, roughness: .3 }));
-  mesh.name = name; mesh.position.set(...pos);
-  if (axis === 'z') mesh.rotation.x = Math.PI / 2;
-  parent.add(mesh); return mesh;
-}
-function createFan(parent, index, x, z) {
-  const group = new THREE.Group(); group.name = `Cooling fan ${index + 1}`; group.position.set(x, .18, z); parent.add(group);
-  addCylinder(group, 'Fan frame', .49, .10, [0, 0, 0], 0x101b2a);
-  addCylinder(group, 'Fan hub', .15, .12, [0, .06, 0], palette.metal);
-  for (let i = 0; i < 9; i++) {
-    const blade = new THREE.Mesh(new THREE.BoxGeometry(.12, .045, .34), material(i % 2 ? 0x3e5871 : 0x5a7189));
-    blade.position.set(0, .075, .28); blade.rotation.y = i * Math.PI * 2 / 9; blade.rotation.z = .20; group.add(blade);
-  }
-  group.userData.partType = 'fan'; return group;
-}
-function clearModel() {
-  if (modelRoot) {
-    scene.remove(modelRoot);
-    modelRoot.traverse(o => {
-      if (o.geometry) o.geometry.dispose();
-      if (o.material && o.material !== bpFill && o.material !== bpLine) {
-        if (Array.isArray(o.material)) o.material.forEach(m => m.dispose()); else o.material.dispose();
-      }
-    });
-  }
-  partEntries = []; selectedPart = null; importedObject = null;
-}
-function registerPart(object, label, detail, color, offset) {
-  object.userData.label = label; object.userData.detail = detail; object.userData.color = color; object.userData.explodeOffset = offset;
-  partEntries.push(object);
+window.kalkiAssistantState = window.kalkiAssistantState || "idle";
+window.kalkiVoiceState = window.kalkiVoiceState || { active: false, listening: false, processing: false, status: "" };
+function publishKalkiAssistantState(state) {
+    window.kalkiAssistantState = state;
+    window.dispatchEvent(new CustomEvent("kalki:assistant-state", { detail: { state } }));
+    if (state === "solving") window.ensureKalkiEffects?.();
 }
 
-/* ---------- Dimension lines (blueprint only) ---------- */
-function makeLabel(text) {
-  const c = document.createElement('canvas'); c.width = 256; c.height = 64;
-  const g = c.getContext('2d'); g.font = 'bold 34px monospace'; g.fillStyle = '#cdeeff'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(text, 128, 32);
-  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), transparent: true, depthTest: false }));
-  s.scale.set(.8, .2, 1); return s;
-}
-function makeDims(length, width, spec) {
-  const g = new THREE.Group(); g.name = 'Dimensions'; g.visible = blueprint;
-  const m = new THREE.LineBasicMaterial({ color: 0x7fe3ff, depthTest: false });
-  const L = (pts) => g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts.map(p => new THREE.Vector3(...p))), m));
-  const y = -.08, zl = width / 2 + .28, xl = length / 2 + .28;
-  L([[-length / 2, y, width / 2 + .05], [-length / 2, y, zl + .08]]);
-  L([[length / 2, y, width / 2 + .05], [length / 2, y, zl + .08]]);
-  L([[-length / 2, y, zl], [length / 2, y, zl]]);
-  L([[length / 2 + .05, y, -width / 2], [xl + .08, y, -width / 2]]);
-  L([[length / 2 + .05, y, width / 2], [xl + .08, y, width / 2]]);
-  L([[xl, y, -width / 2], [xl, y, width / 2]]);
-  const a = makeLabel(`${spec.length} mm`); a.position.set(0, y, zl + .17); g.add(a);
-  const b = makeLabel(`${spec.width} mm`); b.position.set(xl + .32, y, 0); g.add(b);
-  return g;
-}
+document.addEventListener("DOMContentLoaded", () => {
+    const chatBox = document.getElementById("chat");
+    const messageInput = document.getElementById("msg");
+    const sendButton = document.getElementById("send");
+    const clearButton = document.getElementById("clear-btn");
+    const micButton = document.getElementById("mic-btn");
+    const settingsToggle = document.getElementById("settings-toggle");
+    const voiceSettings = document.getElementById("voice-settings");
+    const apiKeyInput = document.getElementById("gemini-api-key");
+    const apiKeyStatus = document.getElementById("gemini-key-status");
+    const apiKeySettings = document.getElementById("gemini-api-settings");
+    const saveApiKeyButton = document.getElementById("save-api-key");
+    const clearApiKeyButton = document.getElementById("clear-api-key");
+    const ttsAutoRead = document.getElementById("tts-auto-read");
+    const ttsStopButton = document.getElementById("tts-stop-button");
+    const ttsStatus = document.getElementById("tts-status");
+    const ttsVoiceSelect = document.getElementById("tts-voice-select");
+    const ttsVoiceHelp = document.getElementById("tts-voice-help");
+    const voiceInputLanguage = document.getElementById("voice-input-language");
+    const voiceModeStatus = document.getElementById("voice-mode-status");
+    const desktopPairCodeInput = document.getElementById("desktop-pair-code");
+    const desktopPairButton = document.getElementById("desktop-pair-button");
+    const desktopUnpairButton = document.getElementById("desktop-unpair-button");
+    const desktopAgentStatus = document.getElementById("desktop-agent-status");
 
-function buildGPU(type) {
-  clearModel(); currentModel = type; exploded = false;
-  const spec = modelSpecs[type]; const scale = spec.length / 280;
-  modelRoot = new THREE.Group(); modelRoot.name = spec.title; scene.add(modelRoot);
-  const length = 2.8 * scale, width = 1.05 * (spec.width / 115), boardY = -.08;
-  const pcb = new THREE.Group(); pcb.name = 'PCB board';
-  addBox(pcb, 'PCB substrate', [length, .09, width], [0, boardY, 0], palette.pcb, { metalness: .1, roughness: .7 });
-  for (let i = 0; i < 8; i++) addBox(pcb, 'Circuit trace', [.025, .012, .36], [(-.95 + i * .26) * scale, boardY + .055, -.22], 0x65d5d0);
-  addBox(pcb, 'GPU package', [.66, .12, .57], [-.12, boardY + .10, 0], 0x18212d);
-  addBox(pcb, 'GPU die', [.40, .035, .34], [-.12, boardY + .18, 0], 0x5c6e83);
-  for (let i = 0; i < 6; i++) addBox(pcb, 'Memory module', [.20, .055, .16], [-.88 + i * .30, boardY + .095, .32], 0x303e52);
-  addBox(pcb, 'PCIe connector', [length * .62, .045, .12], [.05, boardY - .07, width * .48], 0xd9b968);
-  registerPart(pcb, 'PCB + electronics', 'Printed circuit board, GPU package and decorative memory modules', palette.pcb, [0, -.28, 0]); modelRoot.add(pcb);
-
-  const cooler = new THREE.Group(); cooler.name = 'Cooler shroud';
-  addBox(cooler, 'Shroud shell', [length, .17, width * .87], [0, .18, 0], palette.shroud, { metalness: .5, roughness: .32 });
-  addBox(cooler, 'Front accent strip', [length * .78, .025, .035], [0, .275, -width * .43], palette.accent);
-  registerPart(cooler, 'Cooler shroud', 'Outer cooler housing · illustrative shape', palette.shroud, [0, .48, 0]); modelRoot.add(cooler);
-
-  const fans = new THREE.Group(); fans.name = 'Cooling fans';
-  const fanCount = spec.fans, span = length * .72, start = -span / 2;
-  for (let i = 0; i < fanCount; i++) { const x = fanCount === 1 ? 0 : start + i * (span / (fanCount - 1)); createFan(fans, i, x, 0); }
-  registerPart(fans, 'Cooling fans', `${fanCount} decorative fan assemblies`, palette.purple, [0, .82, 0]); modelRoot.add(fans);
-
-  const heatsink = new THREE.Group(); heatsink.name = 'Heatsink';
-  addBox(heatsink, 'Heatsink base', [length * .68, .09, width * .55], [0, .01, 0], palette.metal);
-  for (let i = 0; i < 13; i++) addBox(heatsink, 'Cooling fin', [.035, .18, width * .50], [-length * .31 + i * (length * .62 / 12), .12, 0], 0x71869c, { metalness: .7, roughness: .3 });
-  registerPart(heatsink, 'Heatsink', 'Base plate and decorative cooling fins', palette.metal, [0, -.82, 0]); modelRoot.add(heatsink);
-
-  const io = new THREE.Group(); io.name = 'I/O bracket';
-  addBox(io, 'I/O bracket', [.10, .55, width * .90], [-length * .53, .02, 0], 0x64768c, { metalness: .7 });
-  for (let i = 0; i < 3; i++) addBox(io, 'Display port', [.06, .09, .13], [-length * .59, -.08 + i * .15, .05], 0x111722);
-  registerPart(io, 'I/O bracket', 'Display connector side · port details are decorative', 0x64768c, [-.52, 0, 0]); modelRoot.add(io);
-
-  const backplate = new THREE.Group(); backplate.name = 'Backplate';
-  addBox(backplate, 'Backplate panel', [length * .95, .055, width * .82], [0, -.20, 0], 0x35475d, { metalness: .55 });
-  for (let i = 0; i < 7; i++) addBox(backplate, 'Backplate vent', [.04, .012, width * .35], [-length * .35 + i * length * .115, -.166, 0], 0x101a29);
-  registerPart(backplate, 'Backplate', 'Rear support plate with decorative vents', 0x35475d, [0, -.55, 0]); modelRoot.add(backplate);
-
-  modelRoot.add(makeDims(length, width, spec));
-
-  $('modelTitle').textContent = spec.title;
-  $('lengthValue').textContent = `${spec.length} mm`; $('widthValue').textContent = `${spec.width} mm`; $('heightValue').textContent = `${spec.height} mm`;
-  $('componentValue').textContent = String(partEntries.length);
-  $('partCount').textContent = `${partEntries.length} parts`;
-  renderPartsList(); setExploded(false); setBlueprint(blueprint); setWireframe(wireframe);
-  document.querySelectorAll('.model-card').forEach(c => c.classList.toggle('selected', c.dataset.model === type));
-  $('loadingNote').style.display = 'none';
-  window.__3dReady = true;
-}
-function renderPartsList() {
-  const list = $('partsList'); list.innerHTML = '';
-  partEntries.forEach((part) => {
-    const row = document.createElement('div'); row.className = 'part-row' + (part === selectedPart ? ' selected' : '');
-    const swatch = document.createElement('span'); swatch.className = 'part-swatch'; swatch.style.background = '#' + part.userData.color.toString(16).padStart(6, '0');
-    const info = document.createElement('div'); info.className = 'part-info';
-    const b = document.createElement('b'); b.textContent = part.userData.label;
-    const small = document.createElement('small'); small.textContent = part.userData.detail; info.append(b, small);
-    const select = document.createElement('button'); select.textContent = '⌖'; select.title = 'Highlight component'; select.onclick = () => selectPart(part);
-    const eye = document.createElement('button'); eye.textContent = part.visible ? '◉' : '⊘'; eye.title = 'Show/hide component'; eye.onclick = () => { part.visible = !part.visible; eye.textContent = part.visible ? '◉' : '⊘'; };
-    row.append(swatch, info, select, eye); row.onclick = (e) => { if (e.target !== select && e.target !== eye) selectPart(part); }; list.append(row);
-  });
-}
-function selectPart(part) {
-  selectedPart = part; renderPartsList();
-  partEntries.forEach(p => p.traverse(o => {
-    if (o.isMesh && o.userData.orig === undefined && o.material && 'emissive' in o.material) {
-      o.material.emissive = new THREE.Color(p === part ? 0x163e49 : 0x000000); o.material.emissiveIntensity = p === part ? .55 : 0;
+    const MEMORY_KEY = "jarvis_chat_memory";
+    const TTS_AUTO_READ_KEY = "kalki.tts.autoRead";
+    const TTS_VOICE_KEY = "kalki.tts.voiceURI";
+    const VOICE_INPUT_LANGUAGE_KEY = "kalki.voice.inputLanguage";
+    const VOICE_STOP_PHRASES = new Set([
+        "stop", "stop voice", "stop voice chat", "stop voice mode", "stop listening", "stop talking", "end voice chat", "end conversation", "voice off", "turn off voice", "turn off voice chat", "pause voice", "pause voice chat", "cancel voice", "cancel voice chat", "quit voice", "quit voice chat", "goodbye", "that's all", "that's enough",
+        "aapu", "aapeyi", "aapey", "aapandi", "voice aapu", "voice aapeyi", "voice aapey", "voice aapandi", "chaalu", "chalu",
+        "ఆపు", "ఆపేయి", "ఆపండి", "చాలు", "వాయిస్ ఆపు", "వాయిస్ ఆపేయి", "వాయిస్ ఆపండి", "మాట్లాడటం ఆపు", "మాట్లాడడం ఆపండి", "వినడం ఆపు", "వినడం ఆపండి"
+    ]);
+    const DESKTOP_AGENT_URL = "http://127.0.0.1:43187";
+    let desktopSessionToken = null;
+    let activeUtterance = null;
+    let activeSpeakButton = null;
+    let voiceConversationActive = false;
+    let voiceTurnPending = false;
+    let recognitionStarting = false;
+    let voiceRestartTimer = null;
+    const API_KEY_STORAGE = "jarvis_api_key";
+    const BACKEND_HEALTH_URL = "https://jarvis-mobile-edition-alpha.vercel.app/api/health";
+    const BACKEND_COMMAND_URL = "https://jarvis-mobile-edition-alpha.vercel.app/api/command";
+    const INTERACTION_URL = "https://jarvis-mobile-edition-alpha.vercel.app/api/interaction/analyze";
+    function conversationPreferences() { try { return Object.assign({}, JSON.parse(localStorage.getItem("kalki.preferences") || "{}"), JSON.parse(localStorage.getItem("kalki.conversation") || "{}")); } catch (_) { return {}; } }
+    async function analyzeInteraction(text) {
+        try { const prefs = conversationPreferences(); const r = await fetch(INTERACTION_URL, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({text, messages:readMemory().slice(-12), profile:{displayName:prefs.name||"", language:prefs.language||"auto", responseStyle:prefs.style||"short"}, preferences:{askFollowUps:prefs.followUps !== false}})}); return r.ok ? await r.json() : null; } catch (_) { return null; }
     }
-  }));
-  toast(`Selected: ${part.userData.label}`);
-}
-function setExploded(value) { exploded = value; partEntries.forEach(part => { const target = value ? part.userData.explodeOffset : [0, 0, 0]; part.position.set(...target); }); $('explodeLabel').textContent = value ? 'Exploded apart' : 'Parts assembled'; $('explodeBtn').classList.toggle('active', value); if (value) toast('Exploded view enabled'); }
 
-/* ---------- Blueprint mode: blue paper, X-ray edges, top view, dimensions ---------- */
-function setBlueprint(value) {
-  blueprint = value;
-  if (value && wireframe) setWireframe(false);
-  viewport.classList.toggle('blueprint-mode', value);
-  $('blueprintBtn').classList.toggle('active', value);
-  $('view3dBtn').classList.toggle('active', !value);
-  const lbl = viewport.querySelector('.viewport-label'); if (lbl) lbl.textContent = value ? 'BLUEPRINT · TOP VIEW / MM' : 'PERSPECTIVE / MM';
-  if (scene) {
-    scene.background = value ? null : new THREE.Color(0x0b1321);
-    if (floor) floor.visible = !value;
-  }
-  if (modelRoot) {
-    modelRoot.traverse(o => {
-      if (!o.isMesh) return;
-      if (value) {
-        if (o.userData.orig === undefined) o.userData.orig = o.material;
-        o.material = bpFill;
-        if (!o.userData.edges) {
-          const e = new THREE.LineSegments(new THREE.EdgesGeometry(o.geometry, 20), bpLine);
-          o.add(e); o.userData.edges = e;
+    async function sendBackendCommand(text) {
+        const response = await fetch(BACKEND_COMMAND_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data.ok) {
+            throw new Error(data.message || "Backend command bridge unavailable.");
         }
-        o.userData.edges.visible = true;
-      } else {
-        if (o.userData.orig !== undefined) { o.material = o.userData.orig; o.userData.orig = undefined; }
-        if (o.userData.edges) o.userData.edges.visible = false;
-      }
+        return data.result || {};
+    }
+
+    async function checkBackendStatus() {
+        try {
+            await fetch(BACKEND_HEALTH_URL, { cache: "no-store" });
+        } catch (_) {
+            // Keep connection diagnostics out of the conversation surface.
+        }
+    }
+
+    // Fallback models: first one busy ayithe next model try avutundi
+    const MODEL_NAMES = [
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.1-flash-lite"
+    ];
+
+    let recognition = null;
+    let isListening = false;
+
+    function readMemory() {
+        try {
+            return JSON.parse(localStorage.getItem(MEMORY_KEY) || "[]");
+        } catch (error) {
+            return [];
+        }
+    }
+
+    function saveMemory(memory) {
+        localStorage.setItem(
+            MEMORY_KEY,
+            JSON.stringify(memory.slice(-30))
+        );
+    }
+
+    function addToMemory(sender, text, type) {
+        const memory = readMemory();
+        memory.push({ sender, text, type });
+        saveMemory(memory);
+    }
+
+    function showMessage(sender, text, type, save = true) {
+        if (!chatBox) return;
+
+        const message = document.createElement("div");
+        message.className = type === "user" ? "msg user" : "msg";
+
+        const senderElement = document.createElement("strong");
+        const displaySender = sender === "J.A.R.V.I.S" ? "KALKI" : sender;
+        senderElement.textContent = `${displaySender}: `;
+
+        message.appendChild(senderElement);
+        message.appendChild(document.createTextNode(text));
+        const canSpeak = type === "ai" && sender !== "SYSTEM" && sender !== "YOU";
+        let speakButton = null;
+        if (canSpeak) {
+            speakButton = document.createElement("button");
+            speakButton.type = "button";
+            speakButton.className = "speak-button";
+            speakButton.textContent = "🔊 Read aloud";
+            speakButton.setAttribute("aria-label", `Read ${displaySender}'s reply aloud`);
+            speakButton.setAttribute("aria-pressed", "false");
+            speakButton.addEventListener("click", () => {
+                if (activeSpeakButton === speakButton && window.speechSynthesis?.speaking) stopSpeaking();
+                else speak(text, speakButton);
+            });
+            message.appendChild(speakButton);
+        }
+
+        chatBox.appendChild(message);
+        document.body.classList.toggle("has-conversation", chatBox.children.length > 0);
+        chatBox.scrollTop = chatBox.scrollHeight;
+
+        if (save) addToMemory(sender, text, type);
+        if (save && canSpeak && (ttsAutoRead?.checked || voiceConversationActive)) speak(text, speakButton);
+    }
+
+    function loadSavedChat() {
+        const memory = readMemory();
+        const transientStatus = new Set([
+            "System online. AI brain ready.",
+            "Secure backend and WhatsApp bridge online. Explicit commands only.",
+            "Backend online. WhatsApp bridge is not connected.",
+            "Backend connection unavailable. Local AI mode active."
+        ]);
+        memory.forEach((item) => {
+            if (transientStatus.has(String(item.text || "").trim())) return;
+            const sender = item.sender === "J.A.R.V.I.S" ? "KALKI" : item.sender;
+            showMessage(sender || "KALKI", item.text || "", item.type || "ai", false);
+        });
+    }
+
+    function getApiKey() {
+        try { return (localStorage.getItem(API_KEY_STORAGE) || "").trim(); }
+        catch (_) { return ""; }
+    }
+
+    function setApiKeyStatus(message, state = "") {
+        if (!apiKeyStatus) return;
+        apiKeyStatus.textContent = message;
+        apiKeyStatus.classList.toggle("is-saved", state === "saved");
+        apiKeyStatus.classList.toggle("is-error", state === "error");
+    }
+
+    function refreshApiKeyStatus() {
+        if (apiKeyInput) apiKeyInput.value = ""; // Never place a saved secret back into the visible field.
+        setApiKeyStatus(getApiKey()
+            ? "Key saved locally · not verified with Google."
+            : "No key saved on this device.", getApiKey() ? "saved" : "");
+    }
+
+    function saveApiKey() {
+        const value = apiKeyInput?.value.trim() || "";
+        if (!value) {
+            setApiKeyStatus("Enter your Gemini API key first. Nothing was saved.", "error");
+            apiKeyInput?.focus();
+            return;
+        }
+        // Shape check only. This neither contacts Google nor authenticates the key.
+        const plausibleGeminiKey = /^(?:AIza[A-Za-z0-9_-]{20,96}|AQ\.[A-Za-z0-9_-]{20,96})$/.test(value);
+        if (!plausibleGeminiKey) {
+            setApiKeyStatus("Use a standard AIza… key or an AI Studio authorization key starting AQ. This local format check does not verify the key with Google. Nothing was saved.", "error");
+            apiKeyInput?.focus();
+            return;
+        }
+        try {
+            localStorage.setItem(API_KEY_STORAGE, value);
+            if (apiKeyInput) apiKeyInput.value = "";
+            setApiKeyStatus("Key saved locally · format looks plausible only; Google has not verified it.", "saved");
+        } catch (_) {
+            setApiKeyStatus("Could not save in this browser. Check device storage settings and try again.", "error");
+        }
+    }
+
+    function clearApiKey() {
+        try { localStorage.removeItem(API_KEY_STORAGE); }
+        catch (_) { setApiKeyStatus("Could not clear browser-local storage.", "error"); return; }
+        if (apiKeyInput) apiKeyInput.value = "";
+        setApiKeyStatus("Saved key cleared from this browser/device.");
+    }
+
+    function openApiKeySettings() {
+        if (voiceSettings) voiceSettings.hidden = false;
+        if (settingsToggle) settingsToggle.setAttribute("aria-expanded", "true");
+        document.body.classList.add("menu-open");
+        setApiKeyStatus("A Gemini API key is required for AI chat replies. Add it here to continue.", "error");
+        window.setTimeout(() => {
+            apiKeySettings?.scrollIntoView({ behavior: "smooth", block: "center" });
+            apiKeyInput?.focus({ preventScroll: true });
+        }, 180);
+    }
+
+    async function askGemini(interaction = null) {
+        const apiKey = getApiKey();
+
+        if (!apiKey) {
+            throw new Error("API key enter cheyyaledu.");
+        }
+
+        const contents = readMemory()
+            .filter((item) => item.type === "user" || item.type === "ai")
+            .slice(-20)
+            .map((item) => ({
+                role: item.type === "user" ? "user" : "model",
+                parts: [{ text: item.text }]
+            }));
+
+        const apiBase =
+            "https://generativelanguage.googleapis.com/v1beta/models/";
+
+        let lastError = "AI connection failed.";
+
+        for (const modelName of MODEL_NAMES) {
+            try {
+                const apiUrl = apiBase + modelName + ":generateContent";
+
+                const response = await fetch(apiUrl, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "x-goog-api-key": apiKey
+                    },
+                    body: JSON.stringify({
+                        systemInstruction: {
+                            parts: [{
+                                text: `You are KALKI, a warm personal assistant who speaks naturally like a helpful friend, not a robotic list generator. Acknowledge statements, show empathy for emotions, ask at most one relevant follow-up when useful, clarify incomplete requests, and offer one sensible next step. Use Telugu/Teluglish naturally when the user does. Never invent calendar, task, weather, connector, or memory facts. Never claim durable memory beyond the conversation supplied. External actions remain explicit and confirmation-gated; do not send, schedule, or act in the background. ${interaction?.guidance?.tone || "Match the user’s language naturally."} ${interaction?.guidance?.style === "detailed" ? "Give a helpful explanation." : "Prefer concise, human replies."} Recent-context available: ${Boolean(interaction?.signals?.continuityAvailable)}.`
+                            }]
+                        },
+                        contents
+                    })
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    const reply =
+                        data?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+                    if (reply) return reply;
+                    lastError = "AI nundi reply raledu.";
+                    continue;
+                }
+
+                lastError =
+                    data?.error?.message || "AI connection failed.";
+
+                const temporaryProblem =
+                    /high demand|temporar|quota|rate|unavailable|overload|busy|deprecated|not found/i;
+
+                if (!temporaryProblem.test(lastError)) {
+                    break;
+                }
+            } catch (error) {
+                lastError = error.message;
+            }
+        }
+
+        throw new Error(lastError);
+    }
+
+    function resetSpeakButton() {
+        if (activeSpeakButton?.isConnected) {
+            activeSpeakButton.textContent = "🔊 Read aloud";
+            activeSpeakButton.setAttribute("aria-pressed", "false");
+        }
+        activeSpeakButton = null;
+        activeUtterance = null;
+    }
+
+    function stopSpeaking(resumeVoice = true) {
+        if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+        resetSpeakButton();
+        if (resumeVoice && voiceConversationActive) scheduleVoiceListening(350);
+    }
+
+    function speak(text, button = null) {
+        if (!("speechSynthesis" in window) || !("SpeechSynthesisUtterance" in window)) {
+            if (ttsStatus) ttsStatus.textContent = "Text-to-speech is not supported by this browser.";
+            if (voiceConversationActive) scheduleVoiceListening(500);
+            return;
+        }
+        stopSpeaking(false);
+        if (voiceConversationActive && isListening && recognition) {
+            try { recognition.stop(); } catch (_) { /* Already stopped by the browser. */ }
+        }
+        const utterance = new SpeechSynthesisUtterance(String(text));
+        const voices = window.speechSynthesis.getVoices();
+        const selectedVoice = getSelectedTtsVoice(voices);
+        if (selectedVoice) {
+            utterance.voice = selectedVoice;
+            utterance.lang = selectedVoice.lang || "en-IN";
+        } else {
+            const hasTeluguScript = Array.from(String(text)).some((character) => {
+                const codePoint = character.codePointAt(0) || 0;
+                return codePoint >= 0x0C00 && codePoint <= 0x0C7F;
+            });
+            utterance.lang = hasTeluguScript ? "te-IN" : "en-IN";
+        }
+        utterance.rate = 0.96;
+        activeUtterance = utterance;
+        activeSpeakButton = button;
+        if (button) {
+            button.textContent = "⏹ Stop";
+            button.setAttribute("aria-pressed", "true");
+        }
+        utterance.onend = () => {
+            if (activeUtterance !== utterance) return;
+            resetSpeakButton();
+            if (voiceConversationActive) scheduleVoiceListening(550);
+        };
+        utterance.onerror = () => {
+            if (activeUtterance !== utterance) return;
+            resetSpeakButton();
+            if (voiceConversationActive) scheduleVoiceListening(700);
+        };
+        window.speechSynthesis.speak(utterance);
+    }
+
+    // Skill router: no background actions. A skill runs only after an explicit command.
+    const SKILL_REGISTRY = {
+        whatsapp: { name: "WhatsApp", keywords: /\bwhatsapp|message|reply|chat\b/i },
+        youtube: { name: "YouTube", keywords: /\b(youtube|video)\b/i },
+        search: { name: "Web Search", keywords: /\b(search|google|web|news|weather)\b/i },
+        email: { name: "Email", keywords: /\b(email|mail|gmail|outlook)\b/i },
+        calendar: { name: "Calendar", keywords: /\b(calendar|schedule|meeting|event)\b/i },
+        tasks: { name: "Tasks and Reminders", keywords: /\b(task|reminder|todo)\b/i },
+        drive: { name: "Cloud Files", keywords: /\b(drive|file|folder|upload|download)\b/i },
+        documents: { name: "Documents", keywords: /\b(pdf|word|docx|excel|xlsx|spreadsheet|powerpoint|pptx)\b/i },
+        travel: { name: "Travel", keywords: /\b(flight|hotel|travel|trip)\b/i },
+        places: { name: "Places and Restaurants", keywords: /\b(restaurant|place|shop|directions)\b/i },
+        prices: { name: "Price Comparison", keywords: /\b(price|cost|cheap|compare|buy)\b/i },
+        media: { name: "Image and Media", keywords: /\b(image|photo|picture|edit)\b/i },
+        automation: { name: "Multi-step Automation", keywords: /\b(automate|automation|workflow)\b/i },
+        memory: { name: "Personal Memory", keywords: /\b(remember|memory|save this)\b/i }
+    };
+
+    function detectSkill(text) {
+        return Object.entries(SKILL_REGISTRY)
+            .find(([, skill]) => skill.keywords.test(text))?.[0] || null;
+    }
+    function normalizeVoiceStopPhrase(text) {
+        return String(text || "").normalize("NFC").toLowerCase()
+            .replace(/^\s*(?:kalki|కల్కి)[,\s]*/i, "")
+            .replace(/[.,!?;:…]+/g, " ")
+            .replace(/\s+/g, " ").trim()
+            .replace(/\s+(?:please|now)$/i, "").trim();
+    }
+    function detectEverydayTool(text) {
+        if (/\b(time|what time|samayam)\b/i.test(text)) return "time";
+        if (/\b(weather|temperature|varsham)\b/i.test(text)) return "weather";
+        if (/\b(timer|countdown|alarm)\b/i.test(text)) return "timer";
+        if (/\b(dice|roll|coin|flip|head|tail)\b/i.test(text)) return "dice";
+        if (/\b(joke|funny)\b/i.test(text)) return "joke";
+        if (/\b(motivat|inspire|quote)\b/i.test(text)) return "motivation";
+        if (/\b(tech news|ai news)\b/i.test(text)) return "techNews";
+        if (/\b(translate|telugu lo)\b/i.test(text)) return "translate";
+        if (/\b(currency|convert|exchange rate|rupees?|inr|dollar)\b/i.test(text)) return "currency";
+        if (/\b(meaning|define|dictionary)\b/i.test(text)) return "meaning";
+        if (/\b(password)\b/i.test(text)) return "password";
+        if (/\b(wikipedia|wiki)\b/i.test(text)) return "wikipedia";
+        if (/\b(open|launch)\s+(youtube|yt)\b/i.test(text)) return "openYouTube";
+        if (/\b(open|launch)\s+google\b/i.test(text)) return "openGoogle";
+        if (/\b(youtube)\b.*\b(song|search|play)\b/i.test(text)) return "youtubeSearch";
+        if (/\b(bitcoin|btc)\b/i.test(text)) return "bitcoin";
+        return null;
+    }
+
+    // Normalize common English–Telugu (and Telugu transliteration) phrases before routing.
+    function normalizeCommand(text) {
+        return text.trim()
+            .replace(/\b(chey|cheyyi|cheyyandi|kavali)\b/gi, "do")
+            .replace(/\b(teruvu|open\s+chey|open\s+cheyyi)\b/gi, "open")
+            .replace(/\b(pampu|pampinch(u|andi)?|send\s+chey)\b/gi, "send")
+            .replace(/\b(cheppu|chepp(u|andi)?|teliyajey)\b/gi, "tell me")
+            .replace(/\b(latest)\s+AI\s+(news|vishayalu)\b/gi, "search latest AI news")
+            .replace(/\s+/g, " ").trim();
+    }
+
+    function isExplicitAction(text) {
+        return /\b(open|launch|start|send|reply|message|tell|search|find|create|add|schedule|show|read|do)\b/i.test(text)
+            || /చెప్పు|పంపు|చూడు|వెతుకు|తెరువు|చేయి|చెయ్/i.test(text);
+    }
+
+    function openWhatsApp() {
+        // Non-HTTP scheme is handled by the Android wrapper and cannot send a message.
+        const whatsappUrl = "whatsapp://send";
+        showMessage("J.A.R.V.I.S", "Opening WhatsApp. No message was sent.", "ai");
+        window.location.href = whatsappUrl;
+    }
+    function handleLocalCommand(text) {
+        const command = normalizeCommand(text);
+        if (/\b(open|launch|start)\s+(the\s+)?whatsapp\b/i.test(command)
+            || /\bwhatsapp\s+(open|launch|start)\b/i.test(command)) {
+            if (voiceConversationActive) stopVoiceConversation(true, "Voice chat stopped while opening WhatsApp.");
+            openWhatsApp();
+            return true;
+        }
+        return false;
+    }
+
+    function setDesktopAgentStatus(message, state = "") {
+        if (!desktopAgentStatus) return;
+        desktopAgentStatus.textContent = message;
+        desktopAgentStatus.classList.toggle("is-saved", state === "connected");
+        desktopAgentStatus.classList.toggle("is-error", state === "error");
+    }
+
+    function openVoiceSettingsPanel() {
+        if (voiceSettings) voiceSettings.hidden = false;
+        if (settingsToggle) settingsToggle.setAttribute("aria-expanded", "true");
+        document.body.classList.add("menu-open");
+    }
+
+    async function pairDesktopAgent() {
+        const code = desktopPairCodeInput?.value.trim() || "";
+        if (code.length !== 8 || Array.from(code).some((character) => character < "0" || character > "9")) {
+            setDesktopAgentStatus("Enter the 8-digit one-time code shown in the desktop agent terminal.", "error");
+            desktopPairCodeInput?.focus();
+            return;
+        }
+        if (!window.isSecureContext) {
+            setDesktopAgentStatus("Open KALKI over HTTPS on the same computer as the agent.", "error");
+            return;
+        }
+        setDesktopAgentStatus("Connecting to the local desktop agent…");
+        try {
+            const response = await fetch(`${DESKTOP_AGENT_URL}/v1/pair`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ code })
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok || !data.ok || !data.token) throw new Error(data.message || "Pairing failed.");
+            desktopSessionToken = data.token;
+            if (desktopPairCodeInput) desktopPairCodeInput.value = "";
+            setDesktopAgentStatus("Paired for this browser session. Each desktop action still needs approval.", "connected");
+            refreshPendingDesktopApprovals(true);
+        } catch (error) {
+            const message = error?.message && error.message !== "Failed to fetch"
+                ? error.message
+                : "Could not reach the agent. Start it on this computer, allow local-network access, and try again.";
+            setDesktopAgentStatus(message, "error");
+        }
+    }
+
+    function refreshPendingDesktopApprovals(connected) {
+        chatBox?.querySelectorAll('.desktop-action-card[data-desktop-state="pending"]').forEach((card) => {
+            const approve = card.querySelector(".desktop-approve-button");
+            const status = card.querySelector(".desktop-action-status");
+            if (approve) approve.disabled = !connected;
+            if (status) status.textContent = connected
+                ? "Nothing happens until you approve."
+                : "Pair the desktop in Settings before approving.";
+        });
+    }
+
+    function detectDesktopAction(text) {
+        const normalized = normalizeCommand(text).replace(/[.!?]+$/g, "").trim();
+        const names = "calculator|calc|notes|notepad|text editor|browser|web browser";
+        const forward = normalized.match(new RegExp(`^(?:please\\s+)?(?:open|launch|start)\\s+(?:the\\s+)?(${names})(?:\\s+please)?$`, "i"));
+        const reverse = normalized.match(new RegExp(`^(${names})\\s+(?:open|launch|start)$`, "i"));
+        const requested = (forward?.[1] || reverse?.[1] || "").toLowerCase();
+        if (!requested) return null;
+        if (requested === "calculator" || requested === "calc") return { id: "calculator", label: "Calculator" };
+        if (requested === "notes" || requested === "notepad" || requested === "text editor") return { id: "notes", label: "the text editor" };
+        return { id: "browser", label: "a blank tab in your default browser" };
+    }
+
+    async function executeDesktopAction(action) {
+        if (!desktopSessionToken) throw new Error("Pair this desktop in Settings first.");
+        const response = await fetch(`${DESKTOP_AGENT_URL}/v1/command`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${desktopSessionToken}`
+            },
+            body: JSON.stringify({ action })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data.ok) {
+            if (response.status === 401) {
+                desktopSessionToken = null;
+                setDesktopAgentStatus("This browser lost its pairing. Restart the agent to create a fresh code.", "error");
+                refreshPendingDesktopApprovals(false);
+            }
+            throw new Error(data.message || "Desktop action was not completed.");
+        }
+        return data.message || "Desktop action completed.";
+    }
+
+    function showDesktopApprovalCard(action) {
+        if (!chatBox) return;
+        const card = document.createElement("div");
+        card.className = "msg desktop-action-card";
+        card.dataset.desktopState = "pending";
+        const title = document.createElement("strong");
+        title.textContent = "KALKI desktop action";
+        const copy = document.createElement("p");
+        copy.textContent = `Open ${action.label} on the paired computer?`;
+        const status = document.createElement("p");
+        status.className = "desktop-action-status";
+        status.textContent = desktopSessionToken ? "Nothing happens until you approve." : "Pair the desktop in Settings before approving.";
+        const actions = document.createElement("div");
+        actions.className = "desktop-action-buttons";
+        const approve = document.createElement("button");
+        approve.type = "button";
+        approve.className = "desktop-approve-button";
+        approve.textContent = "Approve & open";
+        approve.disabled = !desktopSessionToken;
+        const cancel = document.createElement("button");
+        cancel.type = "button";
+        cancel.className = "desktop-cancel-button";
+        cancel.textContent = "Cancel";
+        actions.append(approve, cancel);
+        card.append(title, copy, status, actions);
+        if (!desktopSessionToken) {
+            const settingsButton = document.createElement("button");
+            settingsButton.type = "button";
+            settingsButton.className = "desktop-settings-button";
+            settingsButton.textContent = "Open Settings to pair";
+            settingsButton.addEventListener("click", openVoiceSettingsPanel);
+            card.appendChild(settingsButton);
+        }
+        cancel.addEventListener("click", () => { card.dataset.desktopState = "cancelled"; status.textContent = "Cancelled. Nothing was opened."; actions.remove(); });
+        approve.addEventListener("click", async () => {
+            approve.disabled = true;
+            cancel.disabled = true;
+            status.textContent = "Waiting for the local agent…";
+            try {
+                const result = await executeDesktopAction(action.id);
+                card.dataset.desktopState = "completed";
+                status.textContent = result;
+            } catch (error) {
+                status.textContent = error.message || "Desktop action failed. Nothing else was attempted.";
+            }
+        });
+        chatBox.appendChild(card);
+        document.body.classList.add("has-conversation");
+        chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    async function sendMessage() {
+        if (!messageInput || !sendButton) return;
+
+        const userText = messageInput.value.trim();
+        if (!userText) return;
+        if (voiceConversationActive) {
+            voiceTurnPending = true;
+            if (isListening && recognition) {
+                try { recognition.stop(); } catch (_) { /* Recognition may already have ended. */ }
+            }
+        }
+
+        showMessage("YOU", userText, "user");
+        messageInput.value = "";
+
+        const commandText = normalizeCommand(userText);
+        const spokenControl = normalizeVoiceStopPhrase(userText);
+        if (voiceConversationActive && VOICE_STOP_PHRASES.has(spokenControl)) {
+            stopVoiceConversation(true);
+            showMessage("KALKI", "Voice conversation stopped.", "ai");
+            if (!ttsAutoRead?.checked) speak("Voice conversation stopped.");
+            return;
+        }
+        const desktopAction = detectDesktopAction(commandText);
+        if (desktopAction) {
+            showDesktopApprovalCard(desktopAction);
+            if (voiceConversationActive) {
+                showMessage("KALKI", "I paused voice listening. Please approve this desktop action on screen before it opens.", "ai");
+                stopVoiceConversation(true, "Waiting for your on-screen approval.");
+            }
+            return;
+        }
+        const everydayTool = detectEverydayTool(commandText);
+        const requestedSkill = detectSkill(commandText);
+        if ((everydayTool || requestedSkill) && isExplicitAction(commandText)) {
+            if (requestedSkill === "whatsapp" && handleLocalCommand(commandText)) return;
+            try {
+                const result = await sendBackendCommand(commandText);
+                showMessage("KALKI", result.message || "Command received.", "ai");
+                if (result.url && result.executed && (result.tool === "openYouTube" || result.tool === "openGoogle" || result.tool === "youtubeSearch" || result.tool === "wikipedia")) window.open(result.url, "_blank", "noopener");
+                if (result.notify && result.seconds) {
+                    window.setTimeout(() => { const text = "⏰ Timer complete!"; showMessage("KALKI", text, "ai"); if (!ttsAutoRead?.checked && !voiceConversationActive) speak(text); if (window.Notification && Notification.permission === "granted") new Notification("KALKI", { body: text }); }, result.seconds * 1000);
+                    if (window.Notification && Notification.permission === "default") Notification.requestPermission().catch(() => {});
+                } else if (result.speak && !ttsAutoRead?.checked && !voiceConversationActive) speak(result.message || "Done");
+            } catch (error) {
+                console.error("JARVIS backend bridge error:", error);
+                showMessage("SYSTEM", "Backend command bridge unavailable. Nothing was executed.", "ai");
+            } finally {
+                finishVoiceTurn();
+            }
+            return;
+        }
+
+        if (handleLocalCommand(userText)) {
+            finishVoiceTurn();
+            return;
+        }
+        if (!getApiKey()) {
+            showMessage("KALKI", "I need your Gemini API key before I can generate an AI reply. Settings is open so you can add it locally; no request was sent to Google.", "ai");
+            openApiKeySettings();
+            if (voiceConversationActive) stopVoiceConversation(true, "Voice chat paused. Add your AI key in Settings to continue.");
+            else finishVoiceTurn();
+            return;
+        }
+        messageInput.disabled = true;
+        sendButton.disabled = true;
+        sendButton.textContent = "...";
+        publishKalkiAssistantState("solving");
+
+        try {
+            const interaction = await analyzeInteraction(userText);
+            if (interaction?.clarification?.question) { showMessage("KALKI", interaction.clarification.question, "ai"); return; }
+            const reply = await askGemini(interaction);
+            showMessage("KALKI", reply, "ai");
+        } catch (error) {
+            console.error("JARVIS AI Error:", error);
+            showMessage("SYSTEM", error.message, "ai");
+        } finally {
+            publishKalkiAssistantState("idle");
+            messageInput.disabled = false;
+            sendButton.disabled = false;
+            sendButton.textContent = "SEND";
+            finishVoiceTurn();
+            if (!voiceConversationActive) messageInput.focus();
+        }
+    }
+
+    function clearChat() {
+        stopSpeaking();
+        localStorage.removeItem(MEMORY_KEY);
+        if (chatBox) chatBox.replaceChildren();
+        document.body.classList.remove("has-conversation");
+        if (messageInput) messageInput.value = "";
+    }
+
+    function setVoiceModeStatus(message, active = voiceConversationActive) {
+        const voiceState = {
+            active: Boolean(active),
+            listening: Boolean(active && isListening && !voiceTurnPending),
+            processing: Boolean(active && voiceTurnPending),
+            status: String(message || "")
+        };
+        window.kalkiVoiceState = voiceState;
+        window.dispatchEvent(new CustomEvent("kalki:voice-state", { detail: voiceState }));
+        if (active) window.ensureKalkiEffects?.();
+        if (voiceModeStatus) {
+            voiceModeStatus.textContent = message;
+            voiceModeStatus.classList.toggle("is-active", active);
+        }
+        if (micButton) {
+            micButton.textContent = active ? "⏹" : "🎙";
+            micButton.setAttribute("aria-label", active ? "Stop voice conversation" : "Start voice conversation");
+            micButton.setAttribute("title", active ? "Stop voice conversation" : "Start voice conversation");
+            micButton.setAttribute("aria-pressed", String(active));
+            micButton.classList.toggle("is-voice-active", active);
+        }
+    }
+
+    function scheduleVoiceListening(delay = 500) {
+        window.clearTimeout(voiceRestartTimer);
+        if (!voiceConversationActive || voiceTurnPending || document.hidden) return;
+        voiceRestartTimer = window.setTimeout(beginVoiceListening, delay);
+    }
+
+    function beginVoiceListening() {
+        if (!voiceConversationActive || !recognition || isListening || recognitionStarting || voiceTurnPending || document.hidden) return;
+        if (window.speechSynthesis?.speaking || window.speechSynthesis?.pending) {
+            scheduleVoiceListening(450);
+            return;
+        }
+        if (voiceInputLanguage && recognition.lang !== voiceInputLanguage.value) recognition.lang = voiceInputLanguage.value;
+        recognitionStarting = true;
+        try {
+            recognition.start();
+        } catch (_) {
+            recognitionStarting = false;
+            stopVoiceConversation(false, "Could not start the microphone. Check permission, then tap the mic to retry.");
+        }
+    }
+
+    function finishVoiceTurn() {
+        voiceTurnPending = false;
+        if (!voiceConversationActive) return;
+        if (window.speechSynthesis?.speaking || window.speechSynthesis?.pending) return;
+        scheduleVoiceListening(550);
+    }
+
+    function startVoiceConversation() {
+        if (!recognition) {
+            setVoiceModeStatus("Voice input is not supported in this browser. Try Chrome or Edge.", false);
+            return;
+        }
+        if (voiceConversationActive) return;
+        stopSpeaking(false);
+        voiceConversationActive = true;
+        voiceTurnPending = false;
+        if ("speechSynthesis" in window && "SpeechSynthesisUtterance" in window) {
+            setVoiceModeStatus("Voice chat is on. Listening after the greeting…", true);
+            speak("Hi, I’m KALKI. I’m listening.", null);
+        } else {
+            setVoiceModeStatus("Voice chat is on. Speak after the microphone starts.", true);
+            beginVoiceListening();
+        }
+    }
+
+    function stopVoiceConversation(keepSpeech = false, statusMessage = "Voice conversation stopped.") {
+        const recognitionMayBeActive = isListening || recognitionStarting;
+        voiceConversationActive = false;
+        voiceTurnPending = false;
+        recognitionStarting = false;
+        window.clearTimeout(voiceRestartTimer);
+        if (recognition && recognitionMayBeActive) {
+            try { recognition.stop(); } catch (_) { /* Already stopped by the browser. */ }
+        }
+        if (!keepSpeech) stopSpeaking(false);
+        setVoiceModeStatus(statusMessage, false);
+    }
+
+    function toggleVoice() {
+        if (voiceConversationActive) stopVoiceConversation();
+        else startVoiceConversation();
+    }
+
+    function setupVoice() {
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SpeechRecognition) {
+            setVoiceModeStatus("Voice chat needs a browser with speech recognition, such as Chrome or Edge.", false);
+            return;
+        }
+
+        recognition = new SpeechRecognition();
+        recognition.lang = voiceInputLanguage?.value || "en-IN";
+        recognition.continuous = false;
+        recognition.interimResults = false;
+
+        recognition.onstart = () => {
+            recognitionStarting = false;
+            isListening = true;
+            if (!voiceConversationActive) {
+                try { recognition.stop(); } catch (_) { /* Stop a late start after the user has exited voice mode. */ }
+                return;
+            }
+            setVoiceModeStatus("Listening… speak naturally. Tap ⏹ to stop.", true);
+        };
+
+        recognition.onresult = (event) => {
+            const text = Array.from(event.results || [])
+                .filter((result) => result.isFinal)
+                .map((result) => result[0]?.transcript || "")
+                .join(" ").trim();
+            if (!text || !messageInput || !voiceConversationActive) return;
+            messageInput.value = text;
+            voiceTurnPending = true;
+            setVoiceModeStatus("Heard you. KALKI is thinking…", true);
+            sendMessage();
+        };
+
+        recognition.onerror = (event) => {
+            recognitionStarting = false;
+            isListening = false;
+            const code = event?.error || "unknown";
+            if (code === "not-allowed" || code === "service-not-allowed" || code === "audio-capture") {
+                stopVoiceConversation(false, "Microphone unavailable. Check the browser permission and tap the mic to retry.");
+                return;
+            }
+            if (voiceConversationActive) {
+                setVoiceModeStatus(code === "no-speech" ? "I didn’t hear anything. Listening again…" : "Voice input paused briefly. Trying again…", true);
+                scheduleVoiceListening(850);
+            }
+        };
+
+        recognition.onend = () => {
+            recognitionStarting = false;
+            isListening = false;
+            if (!voiceConversationActive || voiceTurnPending || window.speechSynthesis?.speaking) return;
+            setVoiceModeStatus("Listening again…", true);
+            scheduleVoiceListening(500);
+        };
+
+        document.addEventListener("visibilitychange", () => {
+            if (document.hidden && voiceConversationActive) {
+                stopVoiceConversation(false, "Voice chat stopped because KALKI is in the background.");
+            }
+        });
+        window.addEventListener("pagehide", () => {
+            if (voiceConversationActive) stopVoiceConversation(false, "Voice chat stopped.");
+        });
+    }
+
+    function installAndroidSharePreview() {
+        const preview = document.getElementById("kalki-share-preview");
+        const summary = document.getElementById("share-summary");
+        const files = document.getElementById("share-files");
+        const dismiss = document.getElementById("share-dismiss");
+        if (!preview) return;
+        let shared = null;
+        function clearPreview() { shared = null; preview.hidden = true; if (files) files.replaceChildren(); }
+        dismiss?.addEventListener("click", clearPreview);
+        document.querySelectorAll("[data-share-action]").forEach((button) => button.addEventListener("click", () => {
+            if (!shared) return;
+            const action = button.dataset.shareAction;
+            const subject = shared.title ? `\nTitle: ${shared.title}` : "";
+            const body = shared.text ? `\nContent: ${shared.text}` : "\nContent: Shared file content is available for review in the originating app.";
+            if (messageInput) { messageInput.value = `${action} this shared content.${subject}${body}\n\n[Draft — review and press Send to approve]`; messageInput.focus(); }
+            showMessage("KALKI", `${action} draft prepared. Review it in the composer; no action was sent or executed.`, "ai");
+        }));
+        window.addEventListener("kalki-share", (event) => {
+            shared = event.detail || {};
+            const type = shared.mimeType || "shared content";
+            const text = shared.text ? shared.text : `Received ${type}`;
+            if (summary) summary.textContent = text;
+            if (files) {
+                files.replaceChildren(...(Array.isArray(shared.files) ? shared.files.map((file) => {
+                    const row = document.createElement("div");
+                    row.textContent = `📎 ${file.name || "Shared item"} · ${file.mimeType || type}`;
+                    return row;
+                }) : []));
+            }
+            preview.hidden = false;
+            preview.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        });
+    }
+
+    function voiceOptionValue(voice) {
+        return voice.voiceURI || `${voice.name}::${voice.lang}`;
+    }
+
+    function getSelectedTtsVoice(voices) {
+        const selected = ttsVoiceSelect?.value || "auto";
+        if (selected === "auto") return null;
+        return voices.find((voice) => voiceOptionValue(voice) === selected) || null;
+    }
+
+    function populateTtsVoiceOptions() {
+        if (!ttsVoiceSelect) return;
+        if (!("speechSynthesis" in window)) {
+            const option = document.createElement("option");
+            option.value = "auto";
+            option.textContent = "Browser default voice";
+            ttsVoiceSelect.replaceChildren(option);
+            ttsVoiceSelect.value = "auto";
+            return;
+        }
+
+        const voices = window.speechSynthesis.getVoices();
+        let saved = "";
+        try { saved = localStorage.getItem(TTS_VOICE_KEY) || ""; } catch (_) { /* Use a session-only choice. */ }
+        const previous = ttsVoiceSelect.value;
+        const autoOption = document.createElement("option");
+        autoOption.value = "auto";
+        autoOption.textContent = "Automatic by reply language";
+        const options = [autoOption, ...voices.map((voice) => {
+            const option = document.createElement("option");
+            option.value = voiceOptionValue(voice);
+            option.textContent = `${voice.name} · ${voice.lang || "device voice"}`;
+            return option;
+        })];
+        ttsVoiceSelect.replaceChildren(...options);
+        if (saved === "auto") {
+            ttsVoiceSelect.value = "auto";
+            if (ttsVoiceHelp) ttsVoiceHelp.textContent = "KALKI will follow the browser’s language-based voice choice.";
+            return;
+        }
+
+        const chosen = voices.find((voice) => voiceOptionValue(voice) === saved)
+            || voices.find((voice) => voiceOptionValue(voice) === previous)
+            || voices.find((voice) => voice.lang?.toLowerCase() === (voiceInputLanguage?.value || "en-IN").toLowerCase())
+            || voices.find((voice) => voice.lang?.toLowerCase().startsWith("en-in"))
+            || voices.find((voice) => voice.default)
+            || voices[0];
+        if (chosen) {
+            ttsVoiceSelect.value = voiceOptionValue(chosen);
+            try { localStorage.setItem(TTS_VOICE_KEY, ttsVoiceSelect.value); } catch (_) { /* Keep this choice for this page only. */ }
+            if (ttsVoiceHelp) ttsVoiceHelp.textContent = `KALKI will keep using ${chosen.name} (${chosen.lang}) on this device. Choose a Telugu voice if available for Telugu pronunciation.`;
+        } else {
+            ttsVoiceSelect.value = "auto";
+            if (ttsVoiceHelp) ttsVoiceHelp.textContent = "No device voice list is available yet; KALKI will use your browser’s default voice.";
+        }
+    }
+
+    function initializeVoiceControls() {
+        if (voiceInputLanguage) {
+            let savedLanguage = "en-IN";
+            try { savedLanguage = localStorage.getItem(VOICE_INPUT_LANGUAGE_KEY) || savedLanguage; } catch (_) { /* Keep default. */ }
+            if (!["en-IN", "te-IN"].includes(savedLanguage)) savedLanguage = "en-IN";
+            voiceInputLanguage.value = savedLanguage;
+            voiceInputLanguage.addEventListener("change", () => {
+                const language = voiceInputLanguage.value === "te-IN" ? "te-IN" : "en-IN";
+                try { localStorage.setItem(VOICE_INPUT_LANGUAGE_KEY, language); } catch (_) { /* Session-only preference. */ }
+                if (recognition) recognition.lang = language;
+                if (voiceConversationActive) {
+                    if (isListening && recognition) recognition.stop();
+                    else scheduleVoiceListening(150);
+                }
+            });
+        }
+        ttsVoiceSelect?.addEventListener("change", () => {
+            try { localStorage.setItem(TTS_VOICE_KEY, ttsVoiceSelect.value); } catch (_) { /* Use this page's selection only. */ }
+            const voice = getSelectedTtsVoice(window.speechSynthesis?.getVoices?.() || []);
+            if (ttsVoiceHelp) ttsVoiceHelp.textContent = voice
+                ? `KALKI will keep using ${voice.name} (${voice.lang}) on this device.`
+                : "KALKI will follow the browser’s language-based voice choice.";
+        });
+        if ("speechSynthesis" in window) {
+            populateTtsVoiceOptions();
+            window.speechSynthesis.onvoiceschanged = populateTtsVoiceOptions;
+        } else {
+            populateTtsVoiceOptions();
+        }
+    }
+
+    if (ttsAutoRead) {
+        try { ttsAutoRead.checked = localStorage.getItem(TTS_AUTO_READ_KEY) === "true"; }
+        catch (_) { ttsAutoRead.checked = false; }
+        if (ttsStatus) ttsStatus.textContent = ttsAutoRead.checked
+            ? "Text replies will be read aloud automatically. Voice chat always speaks while active."
+            : "Text chat stays quiet unless you tap Read aloud. Voice chat speaks while active.";
+        ttsAutoRead.addEventListener("change", () => {
+            try { localStorage.setItem(TTS_AUTO_READ_KEY, String(ttsAutoRead.checked)); }
+            catch (_) { /* The per-message speaker remains available if storage is disabled. */ }
+            if (ttsStatus) ttsStatus.textContent = ttsAutoRead.checked
+                ? "Text replies will be read aloud automatically. Voice chat always speaks while active."
+                : "Text chat stays quiet unless you tap Read aloud. Voice chat speaks while active.";
+        });
+    }
+    ttsStopButton?.addEventListener("click", () => {
+        stopSpeaking();
+        if (ttsStatus) ttsStatus.textContent = "Speech stopped.";
     });
-    const dims = modelRoot.getObjectByName('Dimensions'); if (dims) dims.visible = value;
-  }
-  if (!camera || !controls) return;
-  if (value) { camera.position.set(0, 4.6, .01); controls.target.set(0, 0, 0); camera.lookAt(0, 0, 0); controls.update(); }
-  else fitCamera();
-}
-function setWireframe(value) {
-  if (value && blueprint) setBlueprint(false);
-  wireframe = value;
-  scene.traverse(o => { if (o.isMesh && o.material && o.material !== bpFill) { if (Array.isArray(o.material)) o.material.forEach(m => m.wireframe = value); else o.material.wireframe = value; } });
-  $('wireBtn').classList.toggle('active', value);
-}
-function fitCamera() { if (!camera || !controls) return; camera.position.set(3.8, 2.6, 4.5); controls.target.set(0, 0, 0); camera.lookAt(0, 0, 0); controls.update(); }
-function init3D() {
-  scene = new THREE.Scene(); scene.background = new THREE.Color(0x0b1321);
-  camera = new THREE.PerspectiveCamera(42, viewport.clientWidth / viewport.clientHeight, .1, 100); camera.position.set(3.8, 2.6, 4.5);
-  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true }); renderer.setClearColor(0x000000, 0);
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); renderer.setSize(viewport.clientWidth, viewport.clientHeight); renderer.outputColorSpace = THREE.SRGBColorSpace;
-  viewport.appendChild(renderer.domElement);
-  controls = new OrbitControls(camera, renderer.domElement); controls.enableDamping = true; controls.dampingFactor = .07; controls.minDistance = 2; controls.maxDistance = 12;
-  scene.add(new THREE.HemisphereLight(0xb9e5ff, 0x172032, 2));
-  const key = new THREE.DirectionalLight(0xffffff, 3); key.position.set(3, 5, 4); scene.add(key);
-  const rim = new THREE.PointLight(0x5ee7ef, 18, 12); rim.position.set(-3, 1, 2); scene.add(rim);
-  floor = new THREE.GridHelper(10, 30, 0x2a4861, 0x1b2b40); floor.position.y = -1.1; scene.add(floor);
-  const animate = () => { requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); }; animate();
-  window.addEventListener('resize', () => { const w = viewport.clientWidth, h = viewport.clientHeight; camera.aspect = w / h; camera.updateProjectionMatrix(); renderer.setSize(w, h); });
-}
-function toast(message) { const el = $('toast'); el.textContent = message; el.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('show'), 2400); }
-function downloadBlob(blob, filename) { const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 1500); }
-function exportSTL() {
-  const exporter = new STLExporter(); const exportRoot = new THREE.Group();
-  const visibleParts = partEntries.filter(p => p.visible);
-  if (importedObject) { exportRoot.add(importedObject.clone()); }
-  else visibleParts.forEach(p => {
-    const c = p.clone(true);
-    const drop = []; c.traverse(o => { if (o.isLine || o.isSprite) drop.push(o); }); drop.forEach(o => o.parent && o.parent.remove(o));
-    exportRoot.add(c);
-  });
-  exportRoot.updateMatrixWorld(true);
-  const result = exporter.parse(exportRoot, { binary: true });
-  downloadBlob(new Blob([result], { type: 'application/octet-stream' }), '3d-model-studio.stl'); toast('STL export prepared');
-}
-function importSTL(file) {
-  if (!file) return; const reader = new FileReader();
-  reader.onload = () => {
-    try {
-      const geometry = new STLLoader().parse(reader.result); geometry.computeVertexNormals();
-      setBlueprint(false);
-      clearModel(); modelRoot = new THREE.Group(); modelRoot.name = file.name;
-      const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color: 0x5ee7ef, metalness: .3, roughness: .45, side: THREE.DoubleSide }));
-      mesh.name = file.name; modelRoot.add(mesh); scene.add(modelRoot); importedObject = modelRoot;
-      const box = new THREE.Box3().setFromObject(modelRoot), size = box.getSize(new THREE.Vector3());
-      $('modelTitle').textContent = file.name; $('lengthValue').textContent = `${(size.x * 100).toFixed(1)} mm`; $('widthValue').textContent = `${(size.z * 100).toFixed(1)} mm`; $('heightValue').textContent = `${(size.y * 100).toFixed(1)} mm`;
-      partEntries = [modelRoot]; modelRoot.userData.label = 'Imported STL'; modelRoot.userData.detail = 'Imported mesh · dimensions depend on source units'; modelRoot.userData.color = palette.accent; modelRoot.userData.explodeOffset = [0, 0, 0];
-      $('partCount').textContent = '1 mesh'; $('componentValue').textContent = '1'; renderPartsList(); fitCamera(); toast('STL imported. Check source units before fabrication.');
-    } catch (e) { console.error(e); toast('Could not read this STL file. Try a valid STL.'); }
-  };
-  reader.readAsArrayBuffer(file);
-}
-function blueprintSVG() {
-  const s = modelSpecs[currentModel], w = 900, h = 460, scale = 1.8, cardW = s.length * scale, cardH = s.width * scale;
-  const x = (w - cardW) / 2, y = (h - cardH) / 2;
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"><rect width="100%" height="100%" fill="#0a3d91"/><g stroke="#8fc3ff" stroke-width="1" opacity=".35">${Array.from({ length: 31 }, (_, i) => `<path d="M ${i * 30} 0 V ${h}"/>`).join('')}${Array.from({ length: 16 }, (_, i) => `<path d="M 0 ${i * 30} H ${w}"/>`).join('')}</g><rect x="${x}" y="${y}" width="${cardW}" height="${cardH}" rx="12" fill="none" stroke="#cdeeff" stroke-width="3"/><rect x="${x + 20}" y="${y + 18}" width="${cardW - 40}" height="${cardH - 36}" rx="8" fill="none" stroke="#9fd0ff" stroke-width="2"/>${Array.from({ length: s.fans }, (_, i) => { const cx = x + cardW * (i + 1) / (s.fans + 1), cy = y + cardH / 2; return `<circle cx="${cx}" cy="${cy}" r="${Math.min(cardH * .34, cardW / (s.fans * 3))}" fill="none" stroke="#cdeeff" stroke-width="3"/><circle cx="${cx}" cy="${cy}" r="8" fill="#cdeeff"/>`; }).join('')}<g fill="#e6f6ff" font-family="monospace" font-size="16"><text x="28" y="35">3D MODEL STUDIO / CONCEPT BLUEPRINT</text><text x="${x}" y="${y - 22}">LENGTH: ${s.length} mm (illustrative)</text><text x="${x}" y="${y + cardH + 28}">WIDTH: ${s.width} mm · DEMO DRAWING / NOT MANUFACTURER CAD</text></g><g stroke="#cdeeff" stroke-width="1.5" fill="none"><path d="M ${x} ${y - 8} V ${y - 28} M ${x + cardW} ${y - 8} V ${y - 28} M ${x} ${y - 18} H ${x + cardW}"/><path d="M ${x - 15} ${y} H ${x - 35} M ${x - 15} ${y + cardH} H ${x - 35} M ${x - 25} ${y} V ${y + cardH}"/></g></svg>`;
-  downloadBlob(new Blob([svg], { type: 'image/svg+xml' }), 'gpu-concept-blueprint.svg'); toast('Blueprint SVG downloaded');
-}
-function addChat(text, who) { const el = document.createElement('div'); el.className = `chat-bubble ${who}`; el.textContent = text; $('chatMessages').appendChild(el); $('chatMessages').scrollTop = $('chatMessages').scrollHeight; }
-function handleChat(message) {
-  const q = message.toLowerCase();
-  if (q.includes('explode')) { setExploded(true); addChat('Exploded view is on. The demo components have moved apart.', 'bot'); }
-  else if (q.includes('assemble') || q.includes('reset parts')) { setExploded(false); addChat('Components returned to their assembled positions.', 'bot'); }
-  else if (q.includes('blueprint')) { setBlueprint(true); addChat('Blueprint top view enabled. Use “3D view” to return to perspective.', 'bot'); }
-  else if (q.includes('3d view') || q === '3d') { setBlueprint(false); addChat('Perspective 3D view enabled.', 'bot'); }
-  else if (q.includes('wireframe')) { setWireframe(!wireframe); addChat(`Wireframe ${wireframe ? 'enabled' : 'disabled'}.`, 'bot'); }
-  else if (q.includes('reset view')) { setBlueprint(false); fitCamera(); addChat('Camera view reset.', 'bot'); }
-  else if (q.includes('export') && q.includes('stl')) { exportSTL(); addChat('STL export started.', 'bot'); }
-  else if (q.includes('fan')) { const fan = partEntries.find(p => (p.userData.label || '').toLowerCase().includes('cooling fans')); if (fan) { selectPart(fan); addChat('Selected the cooling fan group in the component tree.', 'bot'); } else addChat('This imported model does not have named fan components.', 'bot'); }
-  else addChat('I can run local commands: “explode parts”, “assemble parts”, “blueprint”, “3D view”, “wireframe”, “reset view”, or “export STL”. For natural-language AI design, connect a secure AI backend later.', 'bot');
-}
-init3D(); buildGPU('phantom');
-$('explodeBtn').onclick = () => setExploded(!exploded);
-$('assembleBtn').onclick = () => setExploded(false);
-$('resetViewBtn').onclick = () => { setBlueprint(false); fitCamera(); };
-$('view3dBtn').onclick = () => setBlueprint(false);
-$('blueprintBtn').onclick = () => setBlueprint(!blueprint);
-$('wireBtn').onclick = () => setWireframe(!wireframe);
-$('downloadStlBtn').onclick = exportSTL;
-$('downloadBlueprintBtn').onclick = blueprintSVG;
-$('stlInput').addEventListener('change', e => importSTL(e.target.files?.[0]));
-document.querySelectorAll('.model-card').forEach(c => c.addEventListener('click', () => { blueprint = false; wireframe = false; buildGPU(c.dataset.model); }));
-$('chatForm').addEventListener('submit', e => { e.preventDefault(); const input = $('chatInput'); const message = input.value.trim(); if (!message) return; addChat(message, 'user'); input.value = ''; handleChat(message); });
-$('themeBtn').onclick = () => document.body.classList.toggle('light');
+    if (!("speechSynthesis" in window) && ttsStatus) {
+        ttsStatus.textContent = "This browser does not provide text-to-speech.";
+    }
+    desktopPairButton?.addEventListener("click", pairDesktopAgent);
+    desktopPairCodeInput?.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") { event.preventDefault(); pairDesktopAgent(); }
+    });
+    desktopUnpairButton?.addEventListener("click", async () => {
+        if (!desktopSessionToken) {
+            setDesktopAgentStatus("No active pairing in this page. Restart the agent if it is still paired elsewhere.");
+            return;
+        }
+        try {
+            const response = await fetch(`${DESKTOP_AGENT_URL}/v1/disconnect`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${desktopSessionToken}` },
+                body: JSON.stringify({})
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok || !data.ok) throw new Error(data.message || "Could not disconnect.");
+            desktopSessionToken = null;
+            setDesktopAgentStatus(data.message || "Disconnected. The agent created a new one-time code.");
+            refreshPendingDesktopApprovals(false);
+        } catch (_) {
+            desktopSessionToken = null;
+            setDesktopAgentStatus("Could not reach the agent. This page cleared its token; restart the agent to reset pairing.", "error");
+            refreshPendingDesktopApprovals(false);
+        }
+    });
+
+    settingsToggle?.addEventListener("click", () => {
+        const open = voiceSettings?.hasAttribute("hidden");
+        if (voiceSettings) voiceSettings.hidden = !open;
+        settingsToggle.setAttribute("aria-expanded", String(open));
+    });
+    saveApiKeyButton?.addEventListener("click", saveApiKey);
+    clearApiKeyButton?.addEventListener("click", clearApiKey);
+    apiKeyInput?.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); saveApiKey(); } });
+
+    if (sendButton) sendButton.addEventListener("click", sendMessage);
+    if (clearButton) clearButton.addEventListener("click", clearChat);
+    if (micButton) micButton.addEventListener("click", toggleVoice);
+
+    if (messageInput) {
+        messageInput.addEventListener("keydown", (event) => {
+            if (event.key === "Enter") {
+                event.preventDefault();
+                sendMessage();
+            }
+        });
+    }
+
+    installAndroidSharePreview();
+    initializeVoiceControls();
+    setupVoice();
+    loadSavedChat();
+    refreshApiKeyStatus();
+    checkBackendStatus();
+    console.log("JARVIS AI fallback system loaded successfully.");
+});
